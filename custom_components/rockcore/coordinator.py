@@ -1,4 +1,4 @@
-"""Data coordinator for the Rockcore Solar (RC-C) integration."""
+"""📊 Data coordinator for the Rockcore Solar (RC-C) integration."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import timedelta
 import logging
+import time
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -18,6 +19,7 @@ from .api import RockcoreAuthError, RockcoreClient, RockcoreError
 from .const import (
     ALARM_COINCIDENCE_WINDOW,
     ALARM_HISTORY_DAYS,
+    ALARM_HISTORY_REFRESH,
     ALARM_RECENT_DAYS,
     ALARM_RECENT_DAYS_MIN,
     DOMAIN,
@@ -28,16 +30,21 @@ _LOGGER = logging.getLogger(__name__)
 type RockcoreConfigEntry = ConfigEntry[RockcoreCoordinator]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🗂️ Data model
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 @dataclass(slots=True)
 class InverterData:
-    """Everything known about a single microinverter."""
+    """🔋 Everything known about a single microinverter."""
 
     org_id: str
     #: Row from ``/station/item/page`` (name, sn, power, energy, isOnline...).
     summary: dict[str, Any] = field(default_factory=dict)
-    #: ``/device/data/{id}`` — the energy counters (day/month/year/total).
+    #: ``/device/data/{id}``: the energy counters (day/month/year/total).
     data: dict[str, Any] = field(default_factory=dict)
-    #: ``/device/detail/{id}`` — grid voltage, frequency, temperature, pvList.
+    #: ``/device/detail/{id}``: grid voltage, frequency, temperature, pvList.
     detail: dict[str, Any] = field(default_factory=dict)
     #: Alarms of this inverter that have not recovered yet.
     active_alarms: list[dict[str, Any]] = field(default_factory=list)
@@ -85,13 +92,11 @@ class InverterData:
 
 @dataclass(slots=True)
 class StationData:
-    """Everything known about a single plant."""
+    """☀️ Everything known about a single plant."""
 
     station_id: str
     #: Row from ``/station/overview/searchStation`` merged with ``/station/item/show``.
     info: dict[str, Any] = field(default_factory=dict)
-    #: Static plant configuration from ``/station/item/info``.
-    config: dict[str, Any] = field(default_factory=dict)
     inverters: dict[str, InverterData] = field(default_factory=dict)
     #: Alarms of this plant's inverters that have not recovered yet.
     active_alarms: list[dict[str, Any]] = field(default_factory=list)
@@ -106,8 +111,16 @@ class StationData:
         return str(self.info.get("name") or f"Plant {self.station_id}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔄 Coordinator
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 class RockcoreCoordinator(DataUpdateCoordinator[dict[str, StationData]]):
-    """Poll the RC-C cloud and expose plants and inverters."""
+    """Poll the RC-C cloud and expose plants and inverters.
+
+    The data is a ``{station_id: StationData}`` mapping, refreshed on every poll.
+    """
 
     config_entry: RockcoreConfigEntry
 
@@ -127,19 +140,37 @@ class RockcoreCoordinator(DataUpdateCoordinator[dict[str, StationData]]):
             update_interval=update_interval,
         )
         self.client = client
+        # 🐢 The 7-day alarm history is refreshed on its own, slower schedule.
+        self._recent_alarms: list[dict[str, Any]] = []
+        self._recent_alarms_at: float | None = None
+
+    async def _async_recent_alarms(self) -> list[dict[str, Any]]:
+        """Return the alarm history, re-fetched at most every ``ALARM_HISTORY_REFRESH``."""
+        now = time.monotonic()
+        if (
+            self._recent_alarms_at is None
+            or now - self._recent_alarms_at >= ALARM_HISTORY_REFRESH.total_seconds()
+        ):
+            self._recent_alarms = await self.client.async_get_recent_alarms(
+                ALARM_HISTORY_DAYS
+            )
+            self._recent_alarms_at = now
+        return self._recent_alarms
 
     async def _async_update_data(self) -> dict[str, StationData]:
         """Fetch plants, their inverters and the live values of each inverter."""
         try:
             return await self._async_fetch()
         except RockcoreAuthError as err:
-            # Surfaced to the user as a re-auth flow instead of a retry loop:
+            # 🔒 Surfaced to the user as a re-auth flow instead of a retry loop:
             # the backend locks the account after ten bad passwords.
             raise ConfigEntryAuthFailed(str(err)) from err
         except RockcoreError as err:
             raise UpdateFailed(str(err)) from err
 
     async def _async_fetch(self) -> dict[str, StationData]:
+        """Run one full poll: plants → inverters → live values → alarms."""
+        # 1️⃣ The plants of the account.
         stations_raw = await self.client.async_get_stations()
         if not stations_raw:
             raise UpdateFailed("The account has no plants")
@@ -151,7 +182,7 @@ class RockcoreCoordinator(DataUpdateCoordinator[dict[str, StationData]]):
                 continue
             stations[station_id] = StationData(station_id=station_id, info=dict(raw))
 
-        # Per plant: the live summary plus the inverter roster. The search
+        # 2️⃣ Per plant: the live summary plus the inverter roster. The search
         # endpoint is the one the app's home screen uses, so it wins on the
         # fields both return (notably installCapacity, which /show reports as
         # the declared array size rather than the sum of the inverters).
@@ -169,14 +200,24 @@ class RockcoreCoordinator(DataUpdateCoordinator[dict[str, StationData]]):
 
         await asyncio.gather(*(_load_station(station) for station in stations.values()))
 
-        # Per inverter: energy counters and live electrical values.
+        # 3️⃣ Per inverter: energy counters and live electrical values.
         async def _load_inverter(inverter: InverterData) -> None:
-            data, detail = await asyncio.gather(
-                self.client.async_get_device_data(inverter.org_id),
-                self.client.async_get_device_detail(inverter.org_id),
+            # 🛡️ One inverter failing must not blank the whole plant: its values
+            # simply read as unknown until the next poll. Credential problems
+            # still propagate, because they affect every request.
+            async def _safe(coro: Any, what: str) -> dict[str, Any]:
+                try:
+                    return await coro
+                except RockcoreAuthError:
+                    raise
+                except RockcoreError as err:
+                    _LOGGER.debug("Could not load %s of %s: %s", what, inverter.org_id, err)
+                    return {}
+
+            inverter.data, inverter.detail = await asyncio.gather(
+                _safe(self.client.async_get_device_data(inverter.org_id), "data"),
+                _safe(self.client.async_get_device_detail(inverter.org_id), "detail"),
             )
-            inverter.data = data
-            inverter.detail = detail
 
         await asyncio.gather(
             *(
@@ -186,11 +227,12 @@ class RockcoreCoordinator(DataUpdateCoordinator[dict[str, StationData]]):
             )
         )
 
+        # 4️⃣ Alarms, attached to the plants and inverters they belong to.
         await self._async_load_alarms(stations)
         return stations
 
     async def _async_load_alarms(self, stations: dict[str, StationData]) -> None:
-        """Attach the open alarms to the plants and inverters they belong to.
+        """🚨 Attach the open alarms to the plants and inverters they belong to.
 
         Alarms are listed per account, not per plant, so they are bucketed here
         by device. The plant's ``isAlarm`` flag is deliberately ignored: it stays
@@ -199,10 +241,10 @@ class RockcoreCoordinator(DataUpdateCoordinator[dict[str, StationData]]):
         active, latest, recent = await asyncio.gather(
             self.client.async_get_active_alarms(),
             self.client.async_get_latest_alarm(),
-            self.client.async_get_recent_alarms(ALARM_HISTORY_DAYS),
+            self._async_recent_alarms(),
         )
 
-        # An alarm carries the device UUID and the serial, never the numeric id.
+        # 🔎 An alarm carries the device UUID and the serial, never the numeric id.
         by_mdm: dict[str, InverterData] = {}
         by_serial: dict[str, InverterData] = {}
         for station in stations.values():
@@ -243,9 +285,9 @@ class RockcoreCoordinator(DataUpdateCoordinator[dict[str, StationData]]):
     def _score_alarms(
         stations: dict[str, StationData], recent: list[dict[str, Any]]
     ) -> None:
-        """Rank each inverter against its peers by isolated, recurrent alarms.
+        """🧮 Rank each inverter against its peers by isolated, recurrent alarms.
 
-        The analysis runs per plant so the fleet a unit is compared against is
+        The analysis runs per plant, so the fleet a unit is compared against is
         the one it shares a grid event with.
         """
         for station in stations.values():
@@ -263,13 +305,3 @@ class RockcoreCoordinator(DataUpdateCoordinator[dict[str, StationData]]):
                 inverter.alarm_stats = station.alarm_stats.per_device.get(
                     serial, DeviceAlarmStats()
                 )
-
-    async def async_load_station_config(self) -> None:
-        """Fetch the static plant configuration once, for device metadata."""
-        if not self.data:
-            return
-        for station in self.data.values():
-            try:
-                station.config = await self.client.async_get_station_info(station.station_id)
-            except RockcoreError as err:  # non-fatal, only used for extra attributes
-                _LOGGER.debug("Could not load config of plant %s: %s", station.station_id, err)

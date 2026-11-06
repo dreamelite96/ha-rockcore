@@ -1,19 +1,27 @@
+# ✅ Validates the integration with the official Home Assistant and HACS checks.
 name: Validate
 
 on:
   push:
   pull_request:
   schedule:
+    # 📅 Weekly, Monday 06:00 UTC: catches breakage caused by new HA/HACS rules.
     - cron: "0 6 * * 1"
   workflow_dispatch:
 
+# 🔒 Read-only token: these jobs only need to read the code.
+permissions:
+  contents: read
+
 jobs:
+  # 🏠 Home Assistant's own validator (manifest, translations, structure).
   hassfest:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: home-assistant/actions/hassfest@master
 
+  # 📦 HACS validator (repository layout and metadata).
   hacs:
     runs-on: ubuntu-latest
     steps:

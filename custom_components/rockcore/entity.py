@@ -1,4 +1,4 @@
-"""Base entities for the Rockcore Solar (RC-C) integration."""
+"""🧱 Base entities for the Rockcore Solar (RC-C) integration."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from .coordinator import InverterData, RockcoreCoordinator, StationData
 
 
 class RockcoreStationEntity(CoordinatorEntity[RockcoreCoordinator]):
-    """An entity that belongs to a plant."""
+    """☀️ An entity that belongs to a plant (one Home Assistant device per plant)."""
 
     _attr_has_entity_name = True
 
@@ -38,7 +38,10 @@ class RockcoreStationEntity(CoordinatorEntity[RockcoreCoordinator]):
 
 
 class RockcoreInverterEntity(CoordinatorEntity[RockcoreCoordinator]):
-    """An entity that belongs to a microinverter."""
+    """🔋 An entity that belongs to a microinverter.
+
+    Each inverter is its own device, linked to its plant through ``via_device``.
+    """
 
     _attr_has_entity_name = True
 

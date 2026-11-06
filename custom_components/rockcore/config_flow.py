@@ -1,4 +1,4 @@
-"""Config flow for the Rockcore Solar (RC-C) integration."""
+"""🧙 Config flow for the Rockcore Solar (RC-C) integration."""
 
 from __future__ import annotations
 
@@ -34,9 +34,11 @@ from .const import (
     MIN_SCAN_INTERVAL,
 )
 from .coordinator import RockcoreConfigEntry
+from .util import timezone_offset_hours
 
 _LOGGER = logging.getLogger(__name__)
 
+#: 📝 The form shown on first setup: the same account used in the RC-C app.
 STEP_USER_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_EMAIL): TextSelector(
@@ -50,20 +52,27 @@ STEP_USER_SCHEMA = vol.Schema(
 
 
 class RockcoreConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Handle the Rockcore Solar config flow."""
+    """🧙 Handle the Rockcore Solar config flow (setup and re-authentication)."""
 
     VERSION = 1
 
     async def _async_validate(self, email: str, password: str) -> tuple[RockcoreClient, str]:
-        """Log in and return the client plus the account id."""
-        client = RockcoreClient(async_get_clientsession(self.hass), email, password)
+        """🔐 Log in and return the client plus the account id."""
+        client = RockcoreClient(
+            async_get_clientsession(self.hass),
+            email,
+            password,
+            timezone_offset=timezone_offset_hours,
+        )
         await client.async_login()
         return client, client.user_id or email
+
+    # ── 🆕 First setup ───────────────────────────────────────────────────────
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle the initial step."""
+        """Handle the initial step: ask for the credentials and check them."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -72,13 +81,14 @@ class RockcoreConfigFlow(ConfigFlow, domain=DOMAIN):
             try:
                 client, account_id = await self._async_validate(email, password)
             except RockcoreAuthError as err:
-                # The cloud locks the account after ten bad passwords, so the
-                # remaining-attempts hint is worth showing verbatim.
+                # ⚠️ The cloud locks the account after ten bad passwords, so the
+                # error text shown to the user warns about it (see strings.json).
                 _LOGGER.debug("Rockcore rejected the credentials: %s", err)
                 errors["base"] = "invalid_auth"
             except RockcoreError:
                 errors["base"] = "cannot_connect"
             else:
+                # 🆔 One entry per cloud account.
                 await self.async_set_unique_id(account_id)
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
@@ -90,6 +100,8 @@ class RockcoreConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="user", data_schema=STEP_USER_SCHEMA, errors=errors
         )
 
+    # ── 🔁 Re-authentication ─────────────────────────────────────────────────
+
     async def async_step_reauth(
         self, entry_data: Mapping[str, Any]
     ) -> ConfigFlowResult:
@@ -99,7 +111,7 @@ class RockcoreConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Ask for the password again."""
+        """Ask for the password again (the e-mail is already known)."""
         errors: dict[str, str] = {}
         entry = self._get_reauth_entry()
 
@@ -131,6 +143,8 @@ class RockcoreConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
+    # ── ⚙️ Options ───────────────────────────────────────────────────────────
+
     @staticmethod
     @callback
     def async_get_options_flow(entry: RockcoreConfigEntry) -> RockcoreOptionsFlow:
@@ -139,7 +153,7 @@ class RockcoreConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class RockcoreOptionsFlow(OptionsFlow):
-    """Handle the Rockcore Solar options."""
+    """⚙️ Handle the Rockcore Solar options (the polling interval)."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None

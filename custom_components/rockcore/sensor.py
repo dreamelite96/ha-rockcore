@@ -1,4 +1,4 @@
-"""Sensors for the Rockcore Solar (RC-C) integration."""
+"""📈 Sensors for the Rockcore Solar (RC-C) integration."""
 
 from __future__ import annotations
 
@@ -24,12 +24,19 @@ from homeassistant.const import (
     UnitOfPower,
     UnitOfTemperature,
 )
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
 from .coordinator import InverterData, RockcoreConfigEntry, RockcoreCoordinator, StationData
 from .entity import RockcoreInverterEntity, RockcoreStationEntity
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔄 Value converters
+#
+# The cloud returns loosely typed values (strings, ints, floats, None) and
+# uses its own units, so every sensor goes through one of these first.
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _as_float(value: Any) -> float | None:
@@ -43,39 +50,44 @@ def _as_float(value: Any) -> float | None:
 
 
 def _wh_to_kwh(value: Any) -> float | None:
-    """The API reports energy counters in whole watt-hours."""
+    """⚡ Convert an energy counter: the API reports whole watt-hours."""
     watt_hours = _as_float(value)
     return None if watt_hours is None else watt_hours / 1000
 
 
 def _lifetime_kwh(value: Any) -> float | None:
-    """Lifetime yield, guarding against a spurious zero from the cloud.
+    """🛡️ Convert the lifetime yield, guarding against a spurious zero from the cloud.
 
     These sensors are ``total_increasing``, so a drop to zero would be read as a
     meter reset and the whole counter would be added to the statistics a second
     time. A commissioned plant never goes back to zero lifetime production, so
-    treat a reported 0 as "unknown" and let the next poll fill the gap.
+    a reported 0 is treated as "unknown" and the next poll fills the gap.
     """
     kwh = _wh_to_kwh(value)
     return None if not kwh else kwh
 
 
 def _tonnes_to_kg(value: Any) -> float | None:
-    """The eco counters are reported in tonnes."""
+    """🌱 Convert the eco counters, which the API reports in tonnes."""
     tonnes = _as_float(value)
     return None if tonnes is None else tonnes * 1000
 
 
 def _as_timestamp(value: Any) -> datetime | None:
-    """``lastUpdateTime`` is a millisecond epoch, delivered as a string."""
+    """🕒 Convert ``lastUpdateTime``, a millisecond epoch delivered as a string."""
     millis = _as_float(value)
     if not millis:
         return None
     return dt_util.utc_from_timestamp(millis / 1000)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🏷️ Extra attributes
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def _latest_alarm_attrs(station: StationData) -> dict[str, Any]:
-    """Detail of the most recent alarm, for the attribute dictionary."""
+    """🚨 Detail of the most recent alarm, for the attribute dictionary."""
     alarm = station.latest_alarm or {}
     return {
         "level": alarm.get("alarmLevel"),
@@ -88,10 +100,10 @@ def _latest_alarm_attrs(station: StationData) -> dict[str, Any]:
 
 
 def _isolated_alarm_attrs(station: StationData) -> dict[str, Any]:
-    """Per-inverter breakdown of the isolated-alarm analysis.
+    """🎯 Per-inverter breakdown of the isolated-alarm analysis.
 
-    Reported but never alerted on: the thresholds were calibrated on a week of
-    data with no actual failure in it, so the numbers are here to be watched
+    ⚠️ Reported but never alerted on: the thresholds were calibrated on a week
+    of data with no actual failure in it, so the numbers are here to be watched
     before anything is wired to them.
     """
     stats = station.alarm_stats
@@ -112,6 +124,11 @@ def _isolated_alarm_attrs(station: StationData) -> dict[str, Any]:
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🧩 Entity descriptions
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 @dataclass(frozen=True, kw_only=True)
 class RockcoreStationSensorDescription(SensorEntityDescription):
     """Describes a plant-level sensor."""
@@ -127,6 +144,7 @@ class RockcoreInverterSensorDescription(SensorEntityDescription):
     value_fn: Callable[[InverterData], Any]
 
 
+#: ☀️ Sensors created once per plant.
 STATION_SENSORS: tuple[RockcoreStationSensorDescription, ...] = (
     RockcoreStationSensorDescription(
         key="power",
@@ -233,6 +251,7 @@ STATION_SENSORS: tuple[RockcoreStationSensorDescription, ...] = (
 )
 
 
+#: 🔋 Sensors created once per microinverter.
 INVERTER_SENSORS: tuple[RockcoreInverterSensorDescription, ...] = (
     RockcoreInverterSensorDescription(
         key="power",
@@ -328,7 +347,11 @@ INVERTER_SENSORS: tuple[RockcoreInverterSensorDescription, ...] = (
 
 
 def _pv_descriptions(index: int) -> tuple[RockcoreInverterSensorDescription, ...]:
-    """Build the three sensors of one MPPT input (1-based ``index``)."""
+    """🔆 Build the three sensors (power, voltage, current) of one MPPT input.
+
+    ``index`` is 1-based, as in the app. The inverter reports its inputs as a
+    list, so the sensors read from position ``index - 1``.
+    """
     slot = index - 1
 
     def _field(name: str) -> Callable[[InverterData], Any]:
@@ -376,36 +399,70 @@ def _pv_descriptions(index: int) -> tuple[RockcoreInverterSensorDescription, ...
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🚀 Platform setup
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: RockcoreConfigEntry,
-    async_add_entities: AddConfigEntryEntitiesCallback,
+    async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the Rockcore sensors."""
+    """🚀 Set up the Rockcore sensors.
+
+    Entities are also created later, as soon as a poll reveals a plant, an
+    inverter or an MPPT input that was not there at startup. For example, an
+    inverter that was offline when Home Assistant started reports no PV inputs
+    until it wakes up.
+    """
     coordinator = entry.runtime_data
-    entities: list[SensorEntity] = []
+    #: unique ids already handed to Home Assistant, so nothing is added twice.
+    known: set[str] = set()
 
-    for station_id, station in coordinator.data.items():
-        entities.extend(
-            RockcoreStationSensor(coordinator, station_id, description)
-            for description in STATION_SENSORS
-        )
-        for org_id, inverter in station.inverters.items():
-            entities.extend(
-                RockcoreInverterSensor(coordinator, station_id, org_id, description)
-                for description in INVERTER_SENSORS
-            )
-            for index in range(1, len(inverter.pv_inputs) + 1):
-                entities.extend(
-                    RockcoreInverterSensor(coordinator, station_id, org_id, description)
-                    for description in _pv_descriptions(index)
+    @callback
+    def _async_add_new_entities() -> None:
+        entities: list[SensorEntity] = []
+
+        for station_id, station in (coordinator.data or {}).items():
+            # ☀️ Plant-level sensors.
+            for description in STATION_SENSORS:
+                if (uid := f"{station_id}_{description.key}") not in known:
+                    known.add(uid)
+                    entities.append(RockcoreStationSensor(coordinator, station_id, description))
+
+            # 🔋 Inverter-level sensors, plus three per MPPT input.
+            for org_id, inverter in station.inverters.items():
+                inverter_descriptions = (
+                    *INVERTER_SENSORS,
+                    *(
+                        description
+                        for index in range(1, len(inverter.pv_inputs) + 1)
+                        for description in _pv_descriptions(index)
+                    ),
                 )
+                for description in inverter_descriptions:
+                    if (uid := f"{org_id}_{description.key}") not in known:
+                        known.add(uid)
+                        entities.append(
+                            RockcoreInverterSensor(coordinator, station_id, org_id, description)
+                        )
 
-    async_add_entities(entities)
+        if entities:
+            async_add_entities(entities)
+
+    # Create what exists now, then keep watching every later poll.
+    _async_add_new_entities()
+    entry.async_on_unload(coordinator.async_add_listener(_async_add_new_entities))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 🧱 Entities
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 class RockcoreStationSensor(RockcoreStationEntity, SensorEntity):
-    """A plant-level sensor."""
+    """☀️ A plant-level sensor."""
 
     entity_description: RockcoreStationSensorDescription
 
@@ -428,13 +485,15 @@ class RockcoreStationSensor(RockcoreStationEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         """Return the extra detail this sensor carries, if any."""
-        if self.entity_description.attrs_fn is None:
+        # 🛡️ Home Assistant evaluates this even for an unavailable entity, and
+        # the plant may already be gone from the data by then.
+        if self.entity_description.attrs_fn is None or not self.available:
             return None
         return self.entity_description.attrs_fn(self.station)
 
 
 class RockcoreInverterSensor(RockcoreInverterEntity, SensorEntity):
-    """An inverter-level sensor."""
+    """🔋 An inverter-level sensor."""
 
     entity_description: RockcoreInverterSensorDescription
 
